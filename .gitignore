@@ -151,3 +151,4 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+export_only_prof_dir/

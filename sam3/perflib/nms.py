@@ -20,6 +20,8 @@ except ImportError:
     )
     GENERIC_NMS_AVAILABLE = False
 
+logger = logging.getLogger(__name__)
+
 
 def nms_masks(
     pred_probs: torch.Tensor,
@@ -53,6 +55,11 @@ def nms_masks(
     return keep
 
 
+def _is_npu_tensor(t: torch.Tensor) -> bool:
+    """Check if tensor resides on an Ascend NPU device."""
+    return hasattr(t, "is_npu") and t.is_npu
+
+
 def generic_nms(
     ious: torch.Tensor, scores: torch.Tensor, iou_threshold=0.5
 ) -> torch.Tensor:
@@ -60,6 +67,10 @@ def generic_nms(
 
     assert ious.dim() == 2 and ious.size(0) == ious.size(1)
     assert scores.dim() == 1 and scores.size(0) == ious.size(0)
+
+    # NPU check must precede CUDA: some torch_npu builds report is_cuda=True
+    if _is_npu_tensor(ious):
+        return generic_nms_npu(ious, scores, iou_threshold)
 
     if ious.is_cuda:
         if GENERIC_NMS_AVAILABLE:
@@ -69,8 +80,79 @@ def generic_nms(
 
             return nms_triton(ious, scores, iou_threshold)
 
-    # NPU or CPU fallback
     return generic_nms_cpu(ious, scores, iou_threshold)
+
+
+def generic_nms_npu(
+    ious: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.5
+) -> torch.Tensor:
+    """
+    High-performance greedy NMS for Ascend NPU tensors.
+
+    Adaptively picks the fastest strategy based on problem size:
+    - Small N (< _NPU_NMS_THRESHOLD): single bulk D2H, numpy greedy loop
+      (minimal per-op overhead, same algorithm as original CPU fallback).
+    - Large N: sort + threshold comparison on NPU (parallel), transfer compact
+      bool mask (8x smaller than float32 IoU) to CPU for sequential greedy loop.
+
+    Args:
+        ious: (N, N) pairwise IoU matrix on NPU.
+        scores: (N,) confidence scores on NPU.
+        iou_threshold: suppression threshold.
+
+    Returns:
+        1-D int64 tensor of kept original indices on the input device.
+    """
+    device = scores.device
+    n = scores.size(0)
+    if n == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+
+    if n >= _NPU_NMS_THRESHOLD:
+        return _greedy_nms_npu_sort(ious, scores, iou_threshold)
+    else:
+        return _greedy_nms_via_cpu(ious, scores, iou_threshold)
+
+
+_NPU_NMS_THRESHOLD = 1500
+
+
+def _greedy_nms_via_cpu(
+    ious: torch.Tensor, scores: torch.Tensor, iou_threshold: float
+) -> torch.Tensor:
+    """Single bulk D2H, numpy greedy loop with order-pruning. Fast for small N."""
+    device = scores.device
+    ious_np = ious.float().detach().cpu().numpy()
+    scores_np = scores.float().detach().cpu().numpy()
+    order = scores_np.argsort()[::-1]
+    kept = []
+    while order.size > 0:
+        i = order.item(0)
+        kept.append(i)
+        surviving = np.where(ious_np[i, order[1:]] <= iou_threshold)[0]
+        order = order[surviving + 1]
+    return torch.tensor(kept, dtype=torch.int64, device=device)
+
+
+def _greedy_nms_npu_sort(
+    ious: torch.Tensor, scores: torch.Tensor, iou_threshold: float
+) -> torch.Tensor:
+    """NPU argsort + bool mask, then CPU greedy loop with pruning. Wins for large N."""
+    device = scores.device
+
+    order_npu = torch.argsort(scores, descending=True)
+    ious_sorted = ious[order_npu][:, order_npu]
+    iou_mask_cpu = (ious_sorted > iou_threshold).cpu()
+    order_cpu = order_npu.cpu()
+
+    n = order_cpu.size(0)
+    keep_mask = torch.ones(n, dtype=torch.bool)
+    for i in range(n - 1):
+        if not keep_mask[i]:
+            continue
+        keep_mask[i + 1:] &= ~iou_mask_cpu[i, i + 1:]
+
+    return order_cpu[keep_mask].to(dtype=torch.int64, device=device)
 
 
 def generic_nms_cpu(
