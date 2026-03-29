@@ -71,16 +71,18 @@ def connected_components(input_tensor: torch.Tensor):
         "Input tensor must be (B, H, W) or (B, 1, H, W)."
     )
 
-    if input_tensor.is_cuda:
-        if HAS_CC_TORCH:
+    from sam3.device_utils import is_on_accelerator
+
+    if is_on_accelerator(input_tensor):
+        if input_tensor.is_cuda and HAS_CC_TORCH:
             return get_connected_components(input_tensor.to(torch.uint8))
-        else:
-            # triton fallback
+        elif input_tensor.is_cuda:
             from sam3.perflib.triton.connected_components import (
                 connected_components_triton,
             )
-
             return connected_components_triton(input_tensor)
+        # NPU or other accelerator: fall back to CPU
+        return connected_components_cpu(input_tensor)
 
     # CPU fallback
     return connected_components_cpu(input_tensor)

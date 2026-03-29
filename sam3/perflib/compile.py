@@ -43,16 +43,15 @@ recursive_clone = recursive_fn_factory(torch.clone)
 
 def clone_output_wrapper(f):
     """
-    Clone the CUDA output tensors of a function to avoid in-place operations.
-    Uses tree_map_only (C-optimized pytree traversal) matching onevision's pattern.
-    Requires NestedTensor to be registered as a pytree node (see data_misc.py).
+    Clone accelerator output tensors to avoid in-place operations.
     """
+    from sam3.device_utils import is_on_accelerator
 
     @wraps(f)
     def wrapped(*args, **kwargs):
         outputs = f(*args, **kwargs)
         return tree_map_only(
-            torch.Tensor, lambda t: t.clone() if t.is_cuda else t, outputs
+            torch.Tensor, lambda t: t.clone() if is_on_accelerator(t) else t, outputs
         )
 
     return wrapped
@@ -61,8 +60,12 @@ def clone_output_wrapper(f):
 def compile_wrapper(
     fn, *, mode="max-autotune", fullgraph=True, dynamic=False, name=None
 ):
-    """Compile with recursive_contiguous on inputs and recursive_clone on outputs.
-    Used for SAM2 tracker components that need contiguous inputs for CUDA graphs."""
+    """Compile with recursive_contiguous on inputs and recursive_clone on outputs."""
+    from sam3.device_utils import supports_torch_compile
+
+    if not supports_torch_compile():
+        return fn
+
     compiled_fn = torch.compile(fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
 
     def compiled_fn_wrapper(*args, **kwargs):

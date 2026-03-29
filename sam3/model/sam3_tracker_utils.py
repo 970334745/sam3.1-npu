@@ -382,12 +382,10 @@ def fill_holes_in_mask_scores(
     A post processor to fill small holes in mask scores with area under `max_area`.
     Holes are those small connected components in either background or foreground.
 
-    Note that it relies on the "cc_torch" package to find connected components fast. You can
-    install it via the following command (`TORCH_CUDA_ARCH_LIST=8.0` is for A100 GPUs):
-    ```
-    pip uninstall -y cc_torch; TORCH_CUDA_ARCH_LIST=8.0 9.0 pip install git+https://github.com/ronghanghu/cc_torch
-    ```
-    Otherwise, it will fallback to a slightly slower triton implementation, or skimage if the tensor is on cpu
+    Note that on CUDA it can use the "cc_torch" package for fast connected components
+    (install: ``TORCH_CUDA_ARCH_LIST=8.0 9.0 pip install git+https://github.com/ronghanghu/cc_torch``).
+    If cc_torch is unavailable it falls back to a triton implementation (CUDA only).
+    On Ascend NPU or CPU the dispatcher automatically uses a skimage-based fallback.
     """
 
     if max_area <= 0:

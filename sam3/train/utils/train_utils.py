@@ -109,6 +109,10 @@ def set_seeds(seed_value, max_epochs, dist_rank):
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_value)
+    else:
+        from sam3.device_utils import is_npu_available, manual_seed_all
+        if is_npu_available():
+            manual_seed_all(seed_value)
 
 
 def makedir(dir_path):

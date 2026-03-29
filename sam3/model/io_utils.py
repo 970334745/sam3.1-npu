@@ -63,7 +63,9 @@ def load_resource_as_video_frames(
             images.append(img)
         images = torch.stack(images)
         if not offload_video_to_cpu:
-            images = images.cuda()
+            from sam3.device_utils import get_device
+
+            images = images.to(get_device())
         return images, orig_height, orig_width
 
     is_image = (
@@ -104,9 +106,12 @@ def load_image_as_single_frame_video(
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
     if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+        from sam3.device_utils import get_device
+
+        _dev = get_device()
+        images = images.to(_dev)
+        img_mean = img_mean.to(_dev)
+        img_std = img_std.to(_dev)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
@@ -208,9 +213,12 @@ def load_video_frames_from_image_folder(
     ):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
     if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+        from sam3.device_utils import get_device
+
+        _dev = get_device()
+        images = images.to(_dev)
+        img_mean = img_mean.to(_dev)
+        img_std = img_std.to(_dev)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
@@ -320,9 +328,12 @@ def load_video_frames_from_video_file_using_cv2(
     img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
     img_std = torch.tensor(img_std, dtype=torch.float16).view(1, 3, 1, 1)
     if not offload_video_to_cpu:
-        video_tensor = video_tensor.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+        from sam3.device_utils import get_device
+
+        _dev = get_device()
+        video_tensor = video_tensor.to(_dev)
+        img_mean = img_mean.to(_dev)
+        img_std = img_std.to(_dev)
     # normalize by mean and std
     video_tensor -= img_mean
     video_tensor /= img_std
@@ -339,7 +350,9 @@ def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60, do_zeros=F
     else:
         images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float16)
     if not offload_video_to_cpu:
-        images = images.cuda()
+        from sam3.device_utils import get_device
+
+        images = images.to(get_device())
     return images, video_height, video_width
 
 
@@ -408,7 +421,9 @@ class AsyncImageFrameLoader:
         img -= self.img_mean
         img /= self.img_std
         if not self.offload_video_to_cpu:
-            img = img.cuda()
+            from sam3.device_utils import get_device
+
+            img = img.to(get_device())
         self.images[index] = img
         return img
 
@@ -440,7 +455,9 @@ class TorchCodecDecoder:
             self._decoder,
             dimension_order=dimension_order,
             device=device_string,
-            num_threads=(1 if "cuda" in device_string else num_threads),
+            num_threads=(
+                1 if ("cuda" in device_string or "npu" in device_string) else num_threads
+            ),
         )
         video_metadata = core.get_container_metadata(self._decoder)
         best_stream_index = video_metadata.best_video_stream_index
@@ -518,17 +535,19 @@ class AsyncVideoFileLoaderWithTorchCodec:
         gpu_device=None,
         use_rand_seek_in_loading=False,
     ):
+        from sam3.device_utils import current_device, get_accelerator, get_device
+
         # Check and possibly infer the output device (and also get its GPU id when applicable)
-        assert gpu_device is None or gpu_device.type == "cuda"
+        assert gpu_device is None or gpu_device.type in ("cuda", "npu")
         gpu_id = (
             gpu_device.index
             if gpu_device is not None and gpu_device.index is not None
-            else torch.cuda.current_device()
+            else current_device()
         )
         if offload_video_to_cpu:
             out_device = torch.device("cpu")
         else:
-            out_device = torch.device("cuda") if gpu_device is None else gpu_device
+            out_device = get_device() if gpu_device is None else gpu_device
         self.out_device = out_device
         self.gpu_acceleration = gpu_acceleration
         self.gpu_id = gpu_id
@@ -542,9 +561,16 @@ class AsyncVideoFileLoaderWithTorchCodec:
         self.img_std = img_std
 
         if gpu_acceleration:
-            self.img_mean = self.img_mean.to(f"cuda:{self.gpu_id}")
-            self.img_std = self.img_std.to(f"cuda:{self.gpu_id}")
-            decoder_option = {"device": f"cuda:{self.gpu_id}"}
+            _acc = get_accelerator()
+            if _acc == "cpu":
+                _accel_dev = torch.device("cpu")
+                _accel_dev_str = "cpu"
+            else:
+                _accel_dev = torch.device(f"{_acc}:{self.gpu_id}")
+                _accel_dev_str = f"{_acc}:{self.gpu_id}"
+            self.img_mean = self.img_mean.to(_accel_dev)
+            self.img_std = self.img_std.to(_accel_dev)
+            decoder_option = {"device": _accel_dev_str}
         else:
             self.img_mean = self.img_mean.cpu()
             self.img_std = self.img_std.cpu()

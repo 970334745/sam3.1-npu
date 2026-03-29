@@ -128,7 +128,8 @@ def edt_triton(data: torch.Tensor):
         It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
     """
     assert data.dim() == 3
-    assert data.is_cuda
+    from sam3.device_utils import is_on_accelerator
+    assert is_on_accelerator(data), "EDT requires tensor on accelerator (CUDA/NPU)"
     B, H, W = data.shape
     data = data.contiguous()
 

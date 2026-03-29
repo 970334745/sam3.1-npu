@@ -407,9 +407,17 @@ def connected_components_triton(input_tensor: torch.Tensor):
             - A BxHxW output tensor with dense labels. Background is 0.
             - A BxHxW tensor with the size of the connected component for each pixel.
     """
-    assert input_tensor.is_cuda and input_tensor.is_contiguous(), (
-        "Input tensor must be a contiguous CUDA tensor."
-    )
+    if not input_tensor.is_cuda:
+        from sam3.device_utils import is_on_accelerator
+
+        if is_on_accelerator(input_tensor):
+            from sam3.perflib.connected_components import connected_components_cpu
+
+            return connected_components_cpu(input_tensor)
+        raise ValueError(
+            "connected_components_triton requires a CUDA or accelerator tensor."
+        )
+    assert input_tensor.is_contiguous(), "Input tensor must be contiguous."
     out_shape = input_tensor.shape
     if input_tensor.dim() == 4 and input_tensor.shape[1] == 1:
         input_tensor = input_tensor.squeeze(1)

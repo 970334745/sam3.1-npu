@@ -123,7 +123,8 @@ def dilation(mask, kernel_size):
         f"Dilation expects a odd kernel size, got {kernel_size}"
     )
 
-    if mask.is_cuda:
+    from sam3.device_utils import is_on_accelerator
+    if is_on_accelerator(mask):
         m = mask.unsqueeze(1).to(torch.float16)
         k = torch.ones(1, 1, kernel_size, 1, dtype=m.dtype, device=m.device)
 

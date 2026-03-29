@@ -33,10 +33,12 @@ SAM3_COLLECTIVE_OP_TIMEOUT_SEC = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC",
 
 logger = get_logger(__name__)
 
-if torch.cuda.get_device_properties(0).major >= 8:
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+try:
+    from sam3.device_utils import setup_tf32
+
+    setup_tf32()
+except ImportError:
+    pass
 
 
 class Sam3MultiplexTrackerPredictor(nn.Module):
@@ -168,7 +170,11 @@ class Sam3MultiplexTrackerPredictor(nn.Module):
         self.per_obj_inference = per_obj_inference
         self.fill_hole_area = fill_hole_area
         # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        from sam3.device_utils import get_autocast_device_type
+
+        self.bf16_context = torch.autocast(
+            device_type=get_autocast_device_type(), dtype=torch.bfloat16
+        )
         self.bf16_context.__enter__()  # keep using for the entire model process
 
     def __getattr__(self, name):
@@ -399,11 +405,19 @@ class Sam3MultiplexBase(Sam3VideoBase):
             self._profile_save_dir, f"det_track_frame_rank_{self.rank}.json.gz"
         )
 
+        from sam3.device_utils import get_accelerator
+
+        _activities = [torch.profiler.ProfilerActivity.CPU]
+        _acc = get_accelerator()
+        if _acc == "cuda":
+            _activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif _acc == "npu":
+            _npu_act = getattr(torch.profiler.ProfilerActivity, "NPU", None)
+            if _npu_act is not None:
+                _activities.append(_npu_act)
+
         self._profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=_activities,
             record_shapes=True,
             experimental_config=torch.profiler._ExperimentalConfig(
                 profile_all_threads=True
@@ -2854,5 +2868,9 @@ class Sam3MultiplexPredictorWrapper(Sam3MultiplexTrackerPredictor):
         self.is_multiplex_dynamic = is_multiplex_dynamic
 
         # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        from sam3.device_utils import get_autocast_device_type
+
+        self.bf16_context = torch.autocast(
+            device_type=get_autocast_device_type(), dtype=torch.bfloat16
+        )
         self.bf16_context.__enter__()

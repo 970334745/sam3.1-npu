@@ -69,6 +69,7 @@ def generic_nms(
 
             return nms_triton(ious, scores, iou_threshold)
 
+    # NPU or CPU fallback
     return generic_nms_cpu(ious, scores, iou_threshold)
 
 

@@ -81,6 +81,25 @@ def _nms_suppression_kernel(
             tl.debug_barrier()
 
 
+def _nms_cpu_fallback(
+    ious: torch.Tensor,
+    scores: torch.Tensor,
+    iou_threshold: float,
+) -> torch.Tensor:
+    """Pure-PyTorch NMS fallback for non-CUDA devices (e.g. Ascend NPU)."""
+    device = scores.device
+    ious_cpu = ious.cpu()
+    scores_cpu = scores.cpu()
+    num_boxes = scores_cpu.size(0)
+    _, sorted_indices = torch.sort(scores_cpu, dim=0, stable=True, descending=True)
+    iou_mask = (ious_cpu > iou_threshold)[sorted_indices][:, sorted_indices]
+    keep = torch.ones(num_boxes, dtype=torch.bool)
+    for i in range(num_boxes - 1):
+        if keep[i]:
+            keep[i + 1 :] &= ~iou_mask[i, i + 1 :]
+    return sorted_indices[keep].to(device)
+
+
 def nms_triton(
     ious: torch.Tensor,
     scores: torch.Tensor,
@@ -97,6 +116,8 @@ def nms_triton(
         Tensor: Indices of kept boxes, sorted by decreasing score.
     """
     assert scores.dim() == 1, "Scores must be 1D"
+    if not scores.is_cuda:
+        return _nms_cpu_fallback(ious, scores, iou_threshold)
     iou_mask = ious > iou_threshold
     assert iou_mask.dim() == 2
     assert iou_mask.shape[0] == iou_mask.shape[1] == scores.shape[0]

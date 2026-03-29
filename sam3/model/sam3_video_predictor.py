@@ -39,8 +39,9 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
         from sam3.model_builder import build_sam3_video_model
+        from sam3.device_utils import model_to_device
 
-        self.model = (
+        self.model = model_to_device(
             build_sam3_video_model(
                 checkpoint_path=checkpoint_path,
                 bpe_path=bpe_path,
@@ -49,9 +50,8 @@ class Sam3VideoPredictor(Sam3BasePredictor):
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
                 compile=compile,
-            )
-            .cuda()
-            .eval()
+            ),
+            eval_mode=True,
         )
 
     def remove_object(
@@ -74,41 +74,50 @@ class Sam3VideoPredictor(Sam3BasePredictor):
 
     def _get_session_stats(self):
         """Get a statistics string for live sessions and their GPU usage."""
+        from sam3.device_utils import memory_allocated, memory_reserved, max_memory_allocated, max_memory_reserved
         live_session_strs = []
         for sid, s in self._all_inference_states.items():
             nf = s["state"]["num_frames"]
             live_session_strs.append(f"'{sid}' ({nf} frames)")
         joined = ", ".join(live_session_strs)
-        mem_alloc = torch.cuda.memory_allocated() // 1024**2
-        mem_res = torch.cuda.memory_reserved() // 1024**2
-        max_alloc = torch.cuda.max_memory_allocated() // 1024**2
-        max_res = torch.cuda.max_memory_reserved() // 1024**2
+        mem_alloc = memory_allocated() // 1024**2
+        mem_res = memory_reserved() // 1024**2
+        max_alloc = max_memory_allocated() // 1024**2
+        max_res = max_memory_reserved() // 1024**2
         return (
-            f"live sessions: [{joined}], GPU memory: "
+            f"live sessions: [{joined}], device memory: "
             f"{mem_alloc} MiB used and {mem_res} MiB reserved"
             f" (max over time: {max_alloc} MiB used and {max_res} MiB reserved)"
         )
 
     def _get_torch_and_gpu_properties(self):
-        """Get a string for PyTorch and GPU properties."""
-        return (
-            f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
-            f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
-        )
+        """Get a string for PyTorch and device properties."""
+        from sam3.device_utils import get_accelerator
+        acc = get_accelerator()
+        if acc == "cuda":
+            return (
+                f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
+                f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
+            )
+        elif acc == "npu":
+            return f"torch: {torch.__version__}, NPU device: {torch.npu.current_device()}"
+        return f"torch: {torch.__version__}, device: CPU"
 
 
 class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
     def __init__(self, *model_args, gpus_to_use=None, **model_kwargs):
+        from sam3.device_utils import get_accelerator, current_device, device_count, set_device, get_dist_backend
+        acc = get_accelerator()
+
         if gpus_to_use is None:
-            # if not specified, use only the current GPU by default
-            gpus_to_use = [torch.cuda.current_device()]
+            gpus_to_use = [current_device()]
 
         IS_MAIN_PROCESS = os.getenv("IS_MAIN_PROCESS", "1") == "1"
         if IS_MAIN_PROCESS:
             gpus_to_use = sorted(set(gpus_to_use))
-            logger.info(f"using the following GPU IDs: {gpus_to_use}")
+            logger.info(f"using the following device IDs: {gpus_to_use}")
             assert len(gpus_to_use) > 0 and all(isinstance(i, int) for i in gpus_to_use)
-            assert all(0 <= i < torch.cuda.device_count() for i in gpus_to_use)
+            assert all(0 <= i < device_count() for i in gpus_to_use)
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = f"{self._find_free_port()}"
             os.environ["RANK"] = "0"
@@ -118,8 +127,8 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         self.rank_str = f"rank={self.rank} with world_size={self.world_size}"
-        self.device = torch.device(f"cuda:{self.gpus_to_use[self.rank]}")
-        torch.cuda.set_device(self.device)
+        self.device = torch.device(f"{acc}:{self.gpus_to_use[self.rank]}")
+        set_device(self.gpus_to_use[self.rank])
         self.has_shutdown = False
         if self.rank == 0:
             logger.info("\n\n\n\t*** START loading model on all ranks ***\n\n")
@@ -220,27 +229,26 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
         logger.info(f"spawned {world_size - 1} worker processes")
 
     def _start_nccl_process_group(self):
+        from sam3.device_utils import get_dist_backend, to_device
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         if world_size == 1:
             return
 
-        logger.debug(f"starting NCCL process group on {rank=} with {world_size=}")
+        dist_backend = get_dist_backend()
+        logger.debug(f"starting {dist_backend} process group on {rank=} with {world_size=}")
         assert not torch.distributed.is_initialized()
-        # use the "env://" init method with environment variables set in start_worker_processes
-        # a short 3-min timeout to quickly detect any synchronization failures
         timeout_sec = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC", "180"))
         timeout = datetime.timedelta(seconds=timeout_sec)
         torch.distributed.init_process_group(
-            backend="nccl",
+            backend=dist_backend,
             init_method="env://",
             timeout=timeout,
             device_id=self.device,
         )
-        # warm-up the NCCL process group by running a dummy all-reduce
-        tensor = torch.ones(1024, 1024).cuda()
+        tensor = to_device(torch.ones(1024, 1024))
         torch.distributed.all_reduce(tensor)
-        logger.debug(f"started NCCL process group on {rank=} with {world_size=}")
+        logger.debug(f"started {dist_backend} process group on {rank=} with {world_size=}")
 
     def _find_free_port(self) -> int:
         """

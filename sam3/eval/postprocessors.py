@@ -154,9 +154,9 @@ class PostProcessImage(nn.Module):
         if pred_masks is None:
             return None
         if self.always_interpolate_masks_on_gpu:
-            gpu_device = target_sizes.device
-            assert gpu_device.type == "cuda"
-            pred_masks = pred_masks.to(device=gpu_device)
+            accel_device = target_sizes.device
+            assert accel_device.type in ("cuda", "npu")
+            pred_masks = pred_masks.to(device=accel_device)
         if consistent:
             assert keep is None, "TODO: implement?"
             # All masks should have the same shape, expected when processing a batch of size 1
@@ -183,7 +183,7 @@ class PostProcessImage(nn.Module):
                 h, w = target_sizes[i]
                 if keep is not None:
                     mask = mask[keep[i]]
-                # Uses the gpu version fist, moves masks to cpu if it fails"""
+                # Uses the accelerator first, moves masks to CPU if it fails
                 try:
                     interpolated = (
                         interpolate(
@@ -451,16 +451,16 @@ class PostProcessAPIVideo(PostProcessImage):
                 tracked_objects_frame_idx[oid].append(frame_idx)
                 total_num_preds += 1
 
-            # Since we have P*Q masks per frame, mask interpolation is the GPU memory bottleneck or time bottleneck in case of cpu processing.
+            # Since we have P*Q masks per frame, mask interpolation is the accelerator memory bottleneck or time bottleneck in case of cpu processing.
             # Instead, we first extract results only for tracked objects, reducing the number of masks to K = sum_i(tracked_objs_per_ith_prompt), hopefully <<< P*Q
             tracked_objs_outs_td = frame_outs_td[
                 tracked_obj_ids_idx
             ]  # [P,Q,...] --> [K,...]
             meta_td = meta_td[tracked_obj_ids_idx[PROMPT_AXIS].cpu()]
             if self.always_interpolate_masks_on_gpu:
-                gpu_device = meta_td["original_size"].device
-                assert gpu_device.type == "cuda"
-                tracked_objs_outs_td = tracked_objs_outs_td.to(device=gpu_device)
+                accel_device = meta_td["original_size"].device
+                assert accel_device.type in ("cuda", "npu")
+                tracked_objs_outs_td = tracked_objs_outs_td.to(device=accel_device)
             frame_results_td = self(
                 tracked_objs_outs_td.unsqueeze(1),
                 (

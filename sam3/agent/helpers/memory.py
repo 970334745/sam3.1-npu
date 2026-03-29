@@ -11,16 +11,23 @@ import torch
 __all__ = ["retry_if_cuda_oom"]
 
 
+def _is_accelerator_oom_error(e: RuntimeError) -> bool:
+    """Match PyTorch CUDA / Ascend NPU out-of-memory RuntimeError messages."""
+    msg = str(e).lower()
+    if "out of memory" not in msg:
+        return False
+    return "cuda" in msg or "npu" in msg
+
+
 @contextmanager
-def _ignore_torch_cuda_oom():
+def _ignore_accelerator_oom():
     """
-    A context which ignores CUDA OOM exception from pytorch.
+    A context which ignores accelerator (CUDA / NPU) OOM exceptions from PyTorch.
     """
     try:
         yield
     except RuntimeError as e:
-        # NOTE: the string may change?
-        if "CUDA out of memory. " in str(e):
+        if _is_accelerator_oom_error(e):
             pass
         else:
             raise
@@ -29,13 +36,13 @@ def _ignore_torch_cuda_oom():
 def retry_if_cuda_oom(func):
     """
     Makes a function retry itself after encountering
-    pytorch's CUDA OOM error.
-    It will first retry after calling `torch.cuda.empty_cache()`.
+    a PyTorch CUDA or NPU out-of-memory error.
+    It will first retry after calling `sam3.device_utils.empty_cache()`.
 
     If that still fails, it will then retry by trying to convert inputs to CPUs.
     In this case, it expects the function to dispatch to CPU implementation.
     The return values may become CPU tensors as well and it's user's
-    responsibility to convert it back to CUDA tensor if needed.
+    responsibility to move them back to the accelerator if needed.
 
     Args:
         func: a stateless callable that takes tensor-like objects as arguments
@@ -59,28 +66,32 @@ def retry_if_cuda_oom(func):
 
     def maybe_to_cpu(x):
         try:
-            like_gpu_tensor = x.device.type == "cuda" and hasattr(x, "to")
+            dt = x.device.type
+            like_accelerator_tensor = dt in ("cuda", "npu") and hasattr(x, "to")
         except AttributeError:
-            like_gpu_tensor = False
-        if like_gpu_tensor:
+            like_accelerator_tensor = False
+        if like_accelerator_tensor:
             return x.to(device="cpu")
         else:
             return x
 
     @wraps(func)
     def wrapped(*args, **kwargs):
-        with _ignore_torch_cuda_oom():
+        with _ignore_accelerator_oom():
             return func(*args, **kwargs)
 
-        # Clear cache and retry
-        torch.cuda.empty_cache()
-        with _ignore_torch_cuda_oom():
+        from sam3.device_utils import empty_cache
+
+        empty_cache()
+        with _ignore_accelerator_oom():
             return func(*args, **kwargs)
 
         # Try on CPU. This slows down the code significantly, therefore print a notice.
         logger = logging.getLogger(__name__)
         logger.info(
-            "Attempting to copy inputs of {} to CPU due to CUDA OOM".format(str(func))
+            "Attempting to copy inputs of {} to CPU due to accelerator OOM".format(
+                str(func)
+            )
         )
         new_args = (maybe_to_cpu(x) for x in args)
         new_kwargs = {k: maybe_to_cpu(v) for k, v in kwargs.items()}

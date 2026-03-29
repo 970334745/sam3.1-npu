@@ -260,7 +260,12 @@ class Trainer:
 
     def _infer_distributed_backend_if_none(self, distributed_conf, accelerator):
         if distributed_conf.backend is None:
-            distributed_conf.backend = "nccl" if accelerator == "cuda" else "gloo"
+            if accelerator == "cuda":
+                distributed_conf.backend = "nccl"
+            elif accelerator == "npu":
+                distributed_conf.backend = "hccl"
+            else:
+                distributed_conf.backend = "gloo"
 
     def _setup_env_variables(self, env_variables_conf) -> None:
         if env_variables_conf is not None:
@@ -291,6 +296,10 @@ class Trainer:
         if accelerator == "cuda":
             self.device = torch.device("cuda", self.local_rank)
             torch.cuda.set_device(self.local_rank)
+        elif accelerator == "npu":
+            import torch_npu  # noqa: F401
+            self.device = torch.device("npu", self.local_rank)
+            torch.npu.set_device(self.local_rank)
         elif accelerator == "cpu":
             self.device = torch.device("cpu")
         else:
@@ -301,7 +310,7 @@ class Trainer:
 
         self.model = nn.parallel.DistributedDataParallel(
             self.model,
-            device_ids=[self.local_rank] if accelerator == "cuda" else [],
+            device_ids=[self.local_rank] if accelerator in ("cuda", "npu") else [],
             find_unused_parameters=distributed_conf.find_unused_parameters,
             gradient_as_bucket_view=distributed_conf.gradient_as_bucket_view,
             static_graph=distributed_conf.static_graph,
@@ -679,7 +688,7 @@ class Trainer:
             # compute output
             with torch.no_grad():
                 with torch.amp.autocast(
-                    device_type="cuda",
+                    device_type=self.device.type if self.device.type in ("cuda", "npu") else "cpu",
                     enabled=(self.optim_conf.amp.enabled if self.optim_conf else False),
                     dtype=(
                         get_amp_type(self.optim_conf.amp.amp_dtype)
@@ -935,7 +944,7 @@ class Trainer:
             )
             with ddp_context:
                 with torch.amp.autocast(
-                    device_type="cuda",
+                    device_type=self.device.type if self.device.type in ("cuda", "npu") else "cpu",
                     enabled=self.optim_conf.amp.enabled,
                     dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
                 ):

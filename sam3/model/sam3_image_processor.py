@@ -14,10 +14,11 @@ from torchvision.transforms import v2
 class Sam3Processor:
     """ """
 
-    def __init__(self, model, resolution=1008, device="cuda", confidence_threshold=0.5):
+    def __init__(self, model, resolution=1008, device=None, confidence_threshold=0.5):
+        from sam3.device_utils import get_default_device_string
         self.model = model
         self.resolution = resolution
-        self.device = device
+        self.device = device or get_default_device_string()
         self.transform = v2.Compose(
             [
                 v2.ToDtype(torch.uint8, scale=True),
@@ -29,8 +30,8 @@ class Sam3Processor:
         self.confidence_threshold = confidence_threshold
 
         self.find_stage = FindStage(
-            img_ids=torch.tensor([0], device=device, dtype=torch.long),
-            text_ids=torch.tensor([0], device=device, dtype=torch.long),
+            img_ids=torch.tensor([0], device=self.device, dtype=torch.long),
+            text_ids=torch.tensor([0], device=self.device, dtype=torch.long),
             input_boxes=None,
             input_boxes_mask=None,
             input_boxes_label=None,

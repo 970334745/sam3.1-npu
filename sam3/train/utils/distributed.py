@@ -189,26 +189,28 @@ def all_gather(data, force_cpu=False, force_filesys=False, filesys_save_dir=None
 
 def convert_to_distributed_tensor(tensor: torch.Tensor) -> Tuple[torch.Tensor, str]:
     """
-    For some backends, such as NCCL, communication only works if the
-    tensor is on the GPU. This helper function converts to the correct
+    For some backends, such as NCCL/HCCL, communication only works if the
+    tensor is on the accelerator. This helper function converts to the correct
     device and returns the tensor + original device.
     """
-    orig_device = "cpu" if not tensor.is_cuda else "gpu"
+    from sam3.device_utils import is_on_accelerator, to_device
+    orig_device = "cpu" if not is_on_accelerator(tensor) else "gpu"
     if (
         torch.distributed.is_available()
-        and torch.distributed.get_backend() == torch.distributed.Backend.NCCL
-        and not tensor.is_cuda
+        and torch.distributed.get_backend() in ("nccl", "hccl")
+        and not is_on_accelerator(tensor)
     ):
-        tensor = tensor.cuda()
+        tensor = to_device(tensor)
     return (tensor, orig_device)
 
 
 def convert_to_normal_tensor(tensor: torch.Tensor, orig_device: str) -> torch.Tensor:
     """
-    For some backends, such as NCCL, communication only works if the
-    tensor is on the GPU. This converts the tensor back to original device.
+    For some backends, such as NCCL/HCCL, communication only works if the
+    tensor is on the accelerator. This converts the tensor back to original device.
     """
-    if tensor.is_cuda and orig_device == "cpu":
+    from sam3.device_utils import is_on_accelerator
+    if is_on_accelerator(tensor) and orig_device == "cpu":
         tensor = tensor.cpu()
     return tensor
 
@@ -372,7 +374,13 @@ def get_primary_rank() -> int:
 def set_cuda_device_index(idx: int) -> None:
     global _cuda_device_index
     _cuda_device_index = idx
-    torch.cuda.set_device(_cuda_device_index)
+    from sam3.device_utils import get_accelerator
+    acc = get_accelerator()
+    if acc == "cuda":
+        torch.cuda.set_device(_cuda_device_index)
+    elif acc == "npu":
+        import torch_npu  # noqa: F401
+        torch.npu.set_device(_cuda_device_index)
 
 
 def set_cpu_device() -> None:

@@ -232,7 +232,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
-        inference_state["device"] = torch.device("cuda")
+        from sam3.device_utils import get_device
+
+        inference_state["device"] = get_device()
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
         inference_state["constants"] = {}
@@ -1613,43 +1615,47 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         return inference_state
 
     @torch.inference_mode()
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     def warm_up_compilation(self):
         """
         Warm up the model by running a dummy inference to compile the model. This is
         useful to avoid the compilation overhead in the first inference call.
         """
-        if not self.compile_model:
-            return
-        self._warm_up_complete = False
-        if self.device.type != "cuda":
-            raise RuntimeError(
-                f"The model must be on CUDA for warm-up compilation, got {self.device=}."
+        from sam3.device_utils import get_autocast_device_type
+
+        with torch.autocast(device_type=get_autocast_device_type(), dtype=torch.bfloat16):
+            if not self.compile_model:
+                return
+            self._warm_up_complete = False
+            if self.device.type not in ("cuda", "npu"):
+                raise RuntimeError(
+                    f"The model must be on an accelerator for warm-up compilation, got {self.device=}."
+                )
+
+            # temporally set to single GPU temporarily for warm-up compilation
+            orig_rank = self.rank
+            orig_world_size = self.world_size
+            self.rank = self.detector.rank = 0
+            self.world_size = self.detector.world_size = 1
+            orig_recondition_every_nth_frame = self.recondition_every_nth_frame
+            # self.recondition_every_nth_frame = 2
+
+            # Get a random video
+            inference_state = self.init_state(resource_path="<load-zero-video-30>")
+            start_frame_idx = 0
+
+            # Run basic propagation warm-up
+            inference_state = self._warm_up_vg_propagation(
+                inference_state, start_frame_idx
             )
 
-        # temporally set to single GPU temporarily for warm-up compilation
-        orig_rank = self.rank
-        orig_world_size = self.world_size
-        self.rank = self.detector.rank = 0
-        self.world_size = self.detector.world_size = 1
-        orig_recondition_every_nth_frame = self.recondition_every_nth_frame
-        # self.recondition_every_nth_frame = 2
+            logger.info("Warm-up compilation completed.")
 
-        # Get a random video
-        inference_state = self.init_state(resource_path="<load-zero-video-30>")
-        start_frame_idx = 0
-
-        # Run basic propagation warm-up
-        inference_state = self._warm_up_vg_propagation(inference_state, start_frame_idx)
-
-        logger.info("Warm-up compilation completed.")
-
-        # revert to the original GPU and rank
-        self.rank = self.detector.rank = orig_rank
-        self.world_size = self.detector.world_size = orig_world_size
-        self.recondition_every_nth_frame = orig_recondition_every_nth_frame
-        self._warm_up_complete = True
-        self.tracker.transformer.encoder.forward.set_logging(True)
+            # revert to the original GPU and rank
+            self.rank = self.detector.rank = orig_rank
+            self.world_size = self.detector.world_size = orig_world_size
+            self.recondition_every_nth_frame = orig_recondition_every_nth_frame
+            self._warm_up_complete = True
+            self.tracker.transformer.encoder.forward.set_logging(True)
 
     @torch.inference_mode()
     def add_prompt(
@@ -1752,67 +1758,71 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         backbone_out.update(text_outputs)
         return backbone_out
 
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     def forward(self, input: BatchedDatapoint, is_inference: bool = False):
         """This method is only used for benchmark eval (not used in the demo)."""
-        # set the model to single GPU for benchmark evaluation (to be compatible with trainer)
-        orig_rank = self.rank
-        orig_world_size = self.world_size
-        self.rank = self.detector.rank = 0
-        self.world_size = self.detector.world_size = 1
+        from sam3.device_utils import get_autocast_device_type
 
-        # get data
-        text_prompt_ids = input.find_metadatas[0].original_category_id
-        text_prompt_list = input.find_text_batch
+        with torch.autocast(device_type=get_autocast_device_type(), dtype=torch.bfloat16):
+            # set the model to single GPU for benchmark evaluation (to be compatible with trainer)
+            orig_rank = self.rank
+            orig_world_size = self.world_size
+            self.rank = self.detector.rank = 0
+            self.world_size = self.detector.world_size = 1
 
-        # loop over txt prompts
-        tracking_res = defaultdict(dict)  # frame_idx --> {obj_id: mask}
-        scores_labels = defaultdict(tuple)  # obj_id --> (score, text_prompt_id)
-        inference_state = self.init_state(resource_path=input.raw_images)
-        for prompt_id, prompt in zip(text_prompt_ids, text_prompt_list):
-            self.add_prompt(inference_state, frame_idx=0, text_str=prompt)
-            start_obj_id = max(scores_labels.keys(), default=-1) + 1  # prev max + 1
+            # get data
+            text_prompt_ids = input.find_metadatas[0].original_category_id
+            text_prompt_list = input.find_text_batch
 
-            # propagate the prompts
-            obj_ids_this_prompt = set()
-            for frame_idx, out in self.propagate_in_video(
-                inference_state,
-                start_frame_idx=0,
-                max_frame_num_to_track=inference_state["num_frames"],
-                reverse=False,
-            ):
-                out_obj_ids = (
-                    out["out_obj_ids"].numpy()
-                    if isinstance(out["out_obj_ids"], torch.Tensor)
-                    else out["out_obj_ids"]
-                )
-                out_binary_masks = (
-                    out["out_binary_masks"].numpy()
-                    if isinstance(out["out_binary_masks"], torch.Tensor)
-                    else out["out_binary_masks"]
-                )
+            # loop over txt prompts
+            tracking_res = defaultdict(dict)  # frame_idx --> {obj_id: mask}
+            scores_labels = defaultdict(tuple)  # obj_id --> (score, text_prompt_id)
+            inference_state = self.init_state(resource_path=input.raw_images)
+            for prompt_id, prompt in zip(text_prompt_ids, text_prompt_list):
+                self.add_prompt(inference_state, frame_idx=0, text_str=prompt)
+                start_obj_id = max(scores_labels.keys(), default=-1) + 1  # prev max + 1
 
-                current_frame_res = tracking_res[frame_idx]
-                for obj_id, mask in zip(out_obj_ids, out_binary_masks):
-                    mask_tensor = torch.tensor(mask[None], dtype=torch.bool)
-                    current_frame_res[obj_id + start_obj_id] = mask_tensor
-                obj_ids_this_prompt.update(current_frame_res.keys())
+                # propagate the prompts
+                obj_ids_this_prompt = set()
+                for frame_idx, out in self.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=inference_state["num_frames"],
+                    reverse=False,
+                ):
+                    out_obj_ids = (
+                        out["out_obj_ids"].numpy()
+                        if isinstance(out["out_obj_ids"], torch.Tensor)
+                        else out["out_obj_ids"]
+                    )
+                    out_binary_masks = (
+                        out["out_binary_masks"].numpy()
+                        if isinstance(out["out_binary_masks"], torch.Tensor)
+                        else out["out_binary_masks"]
+                    )
 
-            obj_id_to_score = inference_state["tracker_metadata"]["obj_id_to_score"]
-            for obj_id, score in obj_id_to_score.items():
-                if obj_id + start_obj_id in obj_ids_this_prompt:
-                    score_tensor = torch.tensor(score, dtype=torch.float32)
-                    scores_labels[obj_id + start_obj_id] = (score_tensor, prompt_id)
+                    current_frame_res = tracking_res[frame_idx]
+                    for obj_id, mask in zip(out_obj_ids, out_binary_masks):
+                        mask_tensor = torch.tensor(mask[None], dtype=torch.bool)
+                        current_frame_res[obj_id + start_obj_id] = mask_tensor
+                    obj_ids_this_prompt.update(current_frame_res.keys())
 
-            self.reset_state(inference_state)
+                obj_id_to_score = inference_state["tracker_metadata"]["obj_id_to_score"]
+                for obj_id, score in obj_id_to_score.items():
+                    if obj_id + start_obj_id in obj_ids_this_prompt:
+                        score_tensor = torch.tensor(score, dtype=torch.float32)
+                        scores_labels[obj_id + start_obj_id] = (score_tensor, prompt_id)
 
-        video_id = input.find_metadatas[0].original_image_id[0].cpu().item()
-        preds = self.prep_for_evaluator(input.raw_images, tracking_res, scores_labels)
+                self.reset_state(inference_state)
 
-        # revert the model to the original GPU and rank
-        self.rank = self.detector.rank = orig_rank
-        self.world_size = self.detector.world_size = orig_world_size
-        return {video_id: preds}
+            video_id = input.find_metadatas[0].original_image_id[0].cpu().item()
+            preds = self.prep_for_evaluator(
+                input.raw_images, tracking_res, scores_labels
+            )
+
+            # revert the model to the original GPU and rank
+            self.rank = self.detector.rank = orig_rank
+            self.world_size = self.detector.world_size = orig_world_size
+            return {video_id: preds}
 
 
 class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
@@ -3381,7 +3391,7 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         # Create singleton multiplex state and remux extracted tensors
         new_multiplex_state = self.tracker.multiplex_controller.get_state(
             num_valid_entries=1,
-            device=source_state.get("device", "cuda"),
+            device=source_state.get("device", None),
             dtype=torch.float32,
             random=False,
             object_ids=[obj_id],

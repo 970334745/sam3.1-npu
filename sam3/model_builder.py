@@ -50,17 +50,14 @@ from sam3.model.vl_combiner import SAM3VLBackbone, SAM3VLBackboneTri, TriHeadVis
 from sam3.sam.transformer import RoPEAttention
 
 
-# Setup TensorFloat-32 for Ampere GPUs if available
-def _setup_tf32() -> None:
-    """Enable TensorFloat-32 for Ampere GPUs if available."""
-    if torch.cuda.is_available():
-        device_props = torch.cuda.get_device_properties(0)
-        if device_props.major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+from sam3.device_utils import (
+    get_accelerator,
+    get_default_device_string,
+    model_to_device,
+    setup_tf32,
+)
 
-
-_setup_tf32()
+setup_tf32()
 
 
 def _create_position_encoding(precompute_resolution=None):
@@ -563,16 +560,12 @@ def _load_checkpoint(model, checkpoint_path):
 
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
-    if device == "cuda":
-        model = model.cuda()
-    if eval_mode:
-        model.eval()
-    return model
+    return model_to_device(model, device=device, eval_mode=eval_mode)
 
 
 def build_sam3_image_model(
     bpe_path=None,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=get_default_device_string(),
     eval_mode=True,
     checkpoint_path=None,
     load_from_HF=True,
@@ -585,15 +578,7 @@ def build_sam3_image_model(
 
     Args:
         bpe_path: Path to the BPE tokenizer vocabulary
-        device: Device to load the model on ('cuda' or 'cpu')
-        eval_mode: Whether to set the model to evaluation mode
-        checkpoint_path: Optional path to model checkpoint
-        enable_segmentation: Whether to enable segmentation head
-        enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        compile_mode: To enable compilation, set to "default"
-
-    Returns:
-        A SAM3 image model
+        device: Device to load the model on
     """
     if bpe_path is None:
         bpe_path = pkg_resources.resource_filename(
@@ -681,7 +666,7 @@ def build_sam3_video_model(
     geo_encoder_use_img_cross_attn: bool = True,
     strict_state_dict_loading: bool = True,
     apply_temporal_disambiguation: bool = True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=get_default_device_string(),
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
@@ -941,7 +926,7 @@ def build_sam3_multiplex_video_model(
     use_fa3: bool = False,
     use_rope_real: bool = False,
     strict_state_dict_loading: bool = True,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=get_default_device_string(),
     compile=False,
 ):
     """
@@ -1227,7 +1212,7 @@ def build_sam3_multiplex_video_predictor(
                 f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:10]}..."
             )
 
-    demo_model.cuda().eval()
+    model_to_device(demo_model, eval_mode=True)
 
     # Wrap in predictor
     predictor = Sam3MultiplexVideoPredictor(

@@ -1402,11 +1402,11 @@ class VideoTrackingMultiplex(nn.Module):
                     continue
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
-                feats = feats.cuda(non_blocking=True)
+                feats = feats.to(self.device, non_blocking=True)
                 if feats.dim() == 5:
                     feats = multiplex_state.demux(feats).contiguous()
                     prev["maskmem_features"] = (
-                        feats.cpu() if not feats.is_cuda else feats
+                        feats.cpu() if feats.device.type == "cpu" else feats
                     )
 
                 if feats.shape[0] == 0:
@@ -1421,11 +1421,11 @@ class VideoTrackingMultiplex(nn.Module):
                 maskmem_enc = maskmem_pos_list[-1]
                 if maskmem_enc is None:
                     continue
-                maskmem_enc = maskmem_enc.cuda(non_blocking=True)
+                maskmem_enc = maskmem_enc.to(self.device, non_blocking=True)
                 if maskmem_enc.dim() == 5:
                     maskmem_enc = multiplex_state.demux(maskmem_enc).contiguous()
                     prev["maskmem_pos_enc"][-1] = (
-                        maskmem_enc.cpu() if not maskmem_enc.is_cuda else maskmem_enc
+                        maskmem_enc.cpu() if maskmem_enc.device.type == "cpu" else maskmem_enc
                     )
                 maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
 
@@ -1446,8 +1446,8 @@ class VideoTrackingMultiplex(nn.Module):
 
                 if self.save_image_features:
                     # image features are in (HW)BC
-                    image_feat = prev["image_features"].cuda()
-                    image_pos_embed = prev["image_pos_enc"].cuda() + tpos_enc
+                    image_feat = prev["image_features"].to(self.device)
+                    image_pos_embed = prev["image_pos_enc"].to(self.device) + tpos_enc
                     to_cat_image_feat.append(image_feat)
                     to_cat_image_pos_embed.append(image_pos_embed)
 

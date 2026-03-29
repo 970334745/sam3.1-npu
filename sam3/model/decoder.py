@@ -73,7 +73,8 @@ class TransformerDecoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos
 
     def forward_ffn(self, tgt):
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        from sam3.device_utils import get_autocast_device_type
+        with torch.amp.autocast(device_type=get_autocast_device_type(), enabled=False):
             tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
@@ -278,9 +279,10 @@ class TransformerDecoder(nn.Module):
             self.coord_cache = {}
 
             if resolution is not None and stride is not None:
+                from sam3.device_utils import get_default_device_string
                 feat_size = resolution // stride
                 coords_h, coords_w = self._get_coords(
-                    feat_size, feat_size, device="cuda"
+                    feat_size, feat_size, device=get_default_device_string()
                 )
                 self.compilable_cord_cache = (coords_h, coords_w)
                 self.compilable_stored_size = (feat_size, feat_size)
@@ -1045,9 +1047,10 @@ class SimpleRoPEAttention(nn.Module):
         self.compute_cis = partial(
             compute_axial_cis, dim=d_model // num_heads, theta=rope_theta
         )
-        device = torch.device("cuda") if torch.cuda.is_available() else None
+        # Keep freqs_cis on CPU to avoid torch_npu ComplexFloat deepcopy issue;
+        # forward() moves it to the correct device via .to(q.device).
         self.freqs_cis = self.compute_cis(
-            end_x=feat_sizes[0], end_y=feat_sizes[1], device=device
+            end_x=feat_sizes[0], end_y=feat_sizes[1]
         )
 
         self.use_fa3 = use_fa3
